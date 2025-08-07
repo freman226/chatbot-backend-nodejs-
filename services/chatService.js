@@ -1,163 +1,143 @@
+// services/chatService.js
 const axios = require('axios');
 
 class ChatService {
   constructor() {
-    // Configuración para Google Gemini API
-    this.llmConfig = {
-      baseURL: process.env.LLM_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta',
+    // Config Gemini (v1 + modelos 1.5)
+    this.gemini = {
+      baseURL: (process.env.LLM_BASE_URL || 'https://generativelanguage.googleapis.com/v1').replace(/\/$/, ''),
       apiKey: process.env.GEMINI_API_KEY || '',
-      model: process.env.LLM_MODEL || 'gemini-pro'
+      model: (process.env.LLM_MODEL || 'gemini-1.5-flash-latest').trim(),
+      temperature: parseFloat(process.env.LLM_TEMPERATURE || '0.7'),
+      maxOutputTokens: parseInt(process.env.LLM_MAX_TOKENS || '300', 10),
+      topP: parseFloat(process.env.LLM_TOP_P || '0.9'),
+      topK: parseInt(process.env.LLM_TOP_K || '40', 10),
     };
+
+    if (!this.gemini.model.startsWith('gemini')) {
+      // Forzamos un modelo válido si vino algo legacy
+      this.gemini.model = 'gemini-1.5-flash-latest';
+    }
+
+    if (!this.gemini.apiKey) {
+      console.warn('[ChatService] GEMINI_API_KEY no está configurado. Se usará fallback simulado.');
+    } else {
+      console.log('[ChatService] Gemini activado con modelo:', this.gemini.model);
+    }
   }
 
-  async callLLM(prompt, context = null) {
+  /**
+   * Llama a Gemini con prompt + contexto (opcional)
+   */
+  async callGemini(prompt, context = null) {
+    // Construir prompt con contexto
+    let fullPrompt = prompt;
+    if (context) {
+      fullPrompt = `Contexto: ${JSON.stringify(context)}\n\nUsuario: ${prompt}`;
+    }
+
+    // URL y body según API v1 de Gemini
+    const url = `${this.gemini.baseURL}/models/${this.gemini.model}:generateContent?key=${this.gemini.apiKey}`;
+    const body = {
+      contents: [{ parts: [{ text: fullPrompt }]}],
+      generationConfig: {
+        temperature: this.gemini.temperature,
+        maxOutputTokens: this.gemini.maxOutputTokens,
+        topP: this.gemini.topP,
+        topK: this.gemini.topK,
+      },
+    };
+
+    // 🔎 Logs útiles para diagnosticar 401/403/404
+    console.log('Gemini URL  ->', url);
+    console.log('Gemini base ->', this.gemini.baseURL);
+    console.log('Gemini model->', this.gemini.model);
+
     try {
-      // Construir el prompt con contexto si está disponible
-      let fullPrompt = prompt;
-      if (context) {
-        fullPrompt = `Contexto: ${JSON.stringify(context)}\n\nUsuario: ${prompt}`;
-      }
+      const res = await axios.post(url, body, {
+        headers: { 'Content-Type': 'application/json' },
+        timeout: 30000,
+      });
 
-      // Llamada a Google Gemini API
-      const response = await axios.post(
-        `${this.llmConfig.baseURL}/models/${this.llmConfig.model}:generateContent?key=${this.llmConfig.apiKey}`,
-        {
-          contents: [{
-            parts: [{
-              text: fullPrompt
-            }]
-          }],
-          generationConfig: {
-            temperature: 0.7,
-            maxOutputTokens: 150,
-            topP: 0.8,
-            topK: 10
-          }
-        },
-        {
-          headers: {
-            'Content-Type': 'application/json'
-          },
-          timeout: 30000
-        }
-      );
-
-      // Procesar respuesta del modelo Gemini
-      if (response.data && response.data.candidates && response.data.candidates[0] && 
-          response.data.candidates[0].content && response.data.candidates[0].content.parts[0]) {
-        return this.cleanResponse(response.data.candidates[0].content.parts[0].text);
-      }
-
-      // Fallback si no hay respuesta del modelo
-      return this.getFallbackResponse();
-
+      const text = res?.data?.candidates?.[0]?.content?.parts?.[0]?.text || null;
+      return text ? this.cleanResponse(text) : this.getFallbackResponse();
     } catch (error) {
-      console.error('Error llamando al modelo Gemini:', error.message);
-      
-      // Si no hay API key configurada o hay error de conectividad
-      if (error.response && (error.response.status === 401 || error.response.status === 403)) {
-        console.warn('API key de Gemini no válida o no configurada, usando respuesta simulada');
+      const status = error?.response?.status;
+      console.error('Error llamando a Gemini:', status || '', error.message);
+      if (status === 401 || status === 403) {
+        console.warn('Gemini: API key inválida o API no habilitada. Usando respuesta simulada.');
       }
-      
+      if (status === 404) {
+        console.warn('Gemini: modelo/endpoint no encontrado. Verifica LLM_BASE_URL y LLM_MODEL.');
+      }
       return this.getFallbackResponse();
     }
   }
 
   cleanResponse(text) {
-    // Limpiar la respuesta del modelo
-    return text
-      .replace(/^.*Usuario:.*?\n\n?/i, '') // Remover el prompt original
-      .replace(/^.*Contexto:.*?\n\n?/i, '') // Remover contexto si aparece
+    return String(text)
+      .replace(/^.*Usuario:.*?\n\n?/i, '')
+      .replace(/^.*Contexto:.*?\n\n?/i, '')
       .trim();
   }
 
   getFallbackResponse() {
     const responses = [
-      "Entiendo tu consulta. Como modelo de chat, estoy aquí para ayudarte.",
-      "Gracias por tu mensaje. ¿En qué más puedo asistirte?",
-      "He procesado tu solicitud. ¿Necesitas información adicional?",
-      "Comprendo lo que necesitas. Permíteme ayudarte con eso.",
-      "Recibido tu mensaje. Estoy procesando la información para responderte adecuadamente."
+      'Entiendo tu consulta. ¿En qué más puedo ayudarte?',
+      'Gracias por tu mensaje. Si me das un poco más de detalle, puedo ayudarte mejor.',
+      'He procesado tu solicitud. ¿Necesitas información adicional?',
+      'Comprendo lo que necesitas. Permíteme ayudarte con eso.',
+      'Recibido tu mensaje. Estoy preparando una respuesta para ti.',
     ];
-    
     return responses[Math.floor(Math.random() * responses.length)];
   }
 
+  // ---------- API pública del servicio ----------
   async processMessage(message, context = null) {
-    try {
-      console.log('Procesando mensaje:', { message, context });
-      
-      const response = await this.callLLM(message, context);
-      
-      return {
-        text: response,
-        processed_at: new Date().toISOString(),
-        model_used: this.llmConfig.model
-      };
-    } catch (error) {
-      console.error('Error procesando mensaje:', error);
-      throw new Error('No se pudo procesar el mensaje');
-    }
+    console.log('Procesando mensaje:', { message, context });
+    const response = await this.callGemini(message, context);
+    return {
+      text: response,
+      processed_at: new Date().toISOString(),
+      model_used: this.gemini.model,
+      provider: 'gemini',
+    };
   }
 
   async handleEventOne(message, context = null) {
-    try {
-      console.log('Manejando evento uno:', { message, context });
-      
-      // Agregar instrucciones específicas para evento uno
-      const enhancedPrompt = `[EVENTO_UNO] ${message}`;
-      const enhancedContext = {
-        ...context,
-        event_type: 'evento_uno',
-        processing_mode: 'primary_block'
-      };
-
-      const response = await this.callLLM(enhancedPrompt, enhancedContext);
-      
-      return {
-        text: response,
-        event_type: 'evento_uno',
-        processed_at: new Date().toISOString(),
-        model_used: this.llmConfig.model
-      };
-    } catch (error) {
-      console.error('Error manejando evento uno:', error);
-      throw new Error('No se pudo procesar el evento uno');
-    }
+    console.log('Manejando evento uno:', { message, context });
+    const enhancedPrompt = `[EVENTO_UNO] ${message}`;
+    const enhancedContext = { ...context, event_type: 'evento_uno', processing_mode: 'primary_block' };
+    const response = await this.callGemini(enhancedPrompt, enhancedContext);
+    return {
+      text: response,
+      event_type: 'evento_uno',
+      processed_at: new Date().toISOString(),
+      model_used: this.gemini.model,
+      provider: 'gemini',
+    };
   }
 
   async handleEventTwo(message, context = null) {
-    try {
-      console.log('Manejando evento dos:', { message, context });
-      
-      // Agregar instrucciones específicas para evento dos
-      const enhancedPrompt = `[EVENTO_DOS] ${message}`;
-      const enhancedContext = {
-        ...context,
-        event_type: 'evento_dos',
-        processing_mode: 'secondary_block'
-      };
-
-      const response = await this.callLLM(enhancedPrompt, enhancedContext);
-      
-      return {
-        text: response,
-        event_type: 'evento_dos',
-        processed_at: new Date().toISOString(),
-        model_used: this.llmConfig.model
-      };
-    } catch (error) {
-      console.error('Error manejando evento dos:', error);
-      throw new Error('No se pudo procesar el evento dos');
-    }
+    console.log('Manejando evento dos:', { message, context });
+    const enhancedPrompt = `[EVENTO_DOS] ${message}`;
+    const enhancedContext = { ...context, event_type: 'evento_dos', processing_mode: 'secondary_block' };
+    const response = await this.callGemini(enhancedPrompt, enhancedContext);
+    return {
+      text: response,
+      event_type: 'evento_dos',
+      processed_at: new Date().toISOString(),
+      model_used: this.gemini.model,
+      provider: 'gemini',
+    };
   }
 }
 
-// Crear instancia única del servicio
+// Instancia única
 const chatService = new ChatService();
 
 module.exports = {
   processMessage: (message, context) => chatService.processMessage(message, context),
   handleEventOne: (message, context) => chatService.handleEventOne(message, context),
-  handleEventTwo: (message, context) => chatService.handleEventTwo(message, context)
+  handleEventTwo: (message, context) => chatService.handleEventTwo(message, context),
 };
